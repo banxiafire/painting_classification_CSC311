@@ -7,11 +7,11 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 from scipy.sparse import csr_matrix, hstack
-from sklearn.feature_extraction.text import TfidfVectorizer
+from sklearn.feature_extraction.text import CountVectorizer, TfidfVectorizer
 from sklearn.metrics import accuracy_score, confusion_matrix, f1_score, log_loss
 from sklearn.model_selection import GroupKFold, GroupShuffleSplit
-from sklearn.naive_bayes import ComplementNB, MultinomialNB
-from sklearn.preprocessing import LabelEncoder, MultiLabelBinarizer
+from sklearn.naive_bayes import BernoulliNB, ComplementNB, MultinomialNB
+from sklearn.preprocessing import KBinsDiscretizer, LabelEncoder, MultiLabelBinarizer
 
 DATA_PATH = Path(__file__).resolve().parent / "training_data_202601.csv"
 TARGET_COL = "Painting"
@@ -52,8 +52,23 @@ def extract_rating(value):
 def parse_price(value):
     if pd.isna(value):
         return np.nan
-    cleaned = str(value).strip().lower()
-    cleaned = cleaned.replace(",", "").replace(" ", "")
+    cleaned = str(value).strip().lower().replace(",", "")
+
+    range_match = re.search(r"(\d+\.?\d*)\s*(?:-|–|to)\s*(\d+\.?\d*)", cleaned)
+    if range_match is not None:
+        low = float(range_match.group(1))
+        high = float(range_match.group(2))
+        return (low + high) / 2.0
+
+    for pattern, multiplier in [
+        (r"(\d+\.?\d*)\s*(?:billion|bn|b)\b", 1_000_000_000),
+        (r"(\d+\.?\d*)\s*(?:million|m)\b", 1_000_000),
+        (r"(\d+\.?\d*)\s*k\b", 1_000),
+    ]:
+        match = re.search(pattern, cleaned)
+        if match is not None:
+            return float(match.group(1)) * multiplier
+
     cleaned = cleaned.replace("canadian", "").replace("dollars", "")
     cleaned = cleaned.replace("dollar", "").replace("cad", "")
     match = re.search(r"\d+(?:\.\d+)?", cleaned)
@@ -87,53 +102,123 @@ def combine_text(df):
     return combined.str.replace(r"\s+", " ", regex=True).str.strip()
 
 
-def fit_feature_bundle(train_df, config):
-    numeric_df = train_df[NUMERIC_COLS + LIKERT_COLS].apply(pd.to_numeric, errors="coerce")
-    numeric_fill = numeric_df.median().fillna(0.0)
-    numeric_matrix = csr_matrix(numeric_df.fillna(numeric_fill).to_numpy(dtype=float))
+def preprocess_numeric_dataframe(df, price_cap=None):
+    numeric_df = df[NUMERIC_COLS + LIKERT_COLS].apply(pd.to_numeric, errors="coerce").copy()
+    price_col = "How much (in Canadian dollars) would you be willing to pay for this painting?"
+    if price_cap is None:
+        price_cap = numeric_df[price_col].quantile(0.99)
+    if pd.isna(price_cap):
+        price_cap = 0.0
+    numeric_df[price_col] = numeric_df[price_col].clip(lower=0, upper=float(price_cap))
+    numeric_df[price_col] = np.log1p(numeric_df[price_col])
+    return numeric_df, float(price_cap)
 
-    text_vectorizer = TfidfVectorizer(
-        lowercase=True,
-        stop_words="english",
-        ngram_range=config["ngram_range"],
-        min_df=config["min_df"],
-        max_features=config["max_features"],
-        sublinear_tf=True,
-    )
+
+def maybe_binarize_matrix(matrix):
+    binary_matrix = matrix.tocsr(copy=True)
+    if binary_matrix.nnz > 0:
+        binary_matrix.data = np.ones_like(binary_matrix.data)
+    return binary_matrix
+
+
+def fit_feature_bundle(train_df, config):
+    numeric_df, price_cap = preprocess_numeric_dataframe(train_df)
+    numeric_fill = numeric_df.median().fillna(0.0)
+    numeric_df = numeric_df.fillna(numeric_fill)
+
+    if config["use_numeric"]:
+        numeric_binner = KBinsDiscretizer(
+            n_bins=config["numeric_bins"],
+            encode="onehot",
+            strategy="quantile",
+        )
+        numeric_matrix = numeric_binner.fit_transform(numeric_df)
+    else:
+        numeric_binner = None
+        numeric_matrix = None
+
+    if config["text_representation"] == "count":
+        text_vectorizer = CountVectorizer(
+            lowercase=True,
+            stop_words="english",
+            ngram_range=config["ngram_range"],
+            min_df=config["min_df"],
+            max_features=config["max_features"],
+            binary=config["binary_text"],
+        )
+    else:
+        text_vectorizer = TfidfVectorizer(
+            lowercase=True,
+            stop_words="english",
+            ngram_range=config["ngram_range"],
+            min_df=config["min_df"],
+            max_features=config["max_features"],
+            sublinear_tf=True,
+        )
     text_matrix = text_vectorizer.fit_transform(combine_text(train_df))
 
     multilabel_binarizers = {}
     multilabel_matrices = []
-    for col in MULTI_LABEL_COLS:
-        mlb = MultiLabelBinarizer(sparse_output=True)
-        matrix = mlb.fit_transform(train_df[col].apply(split_multilabel))
-        multilabel_binarizers[col] = mlb
-        multilabel_matrices.append(matrix.tocsr())
+    if config["use_multilabel"]:
+        for col in MULTI_LABEL_COLS:
+            mlb = MultiLabelBinarizer(sparse_output=True)
+            matrix = mlb.fit_transform(train_df[col].apply(split_multilabel))
+            multilabel_binarizers[col] = mlb
+            multilabel_matrices.append(matrix.tocsr())
 
     transformers = {
         "numeric_fill": numeric_fill,
+        "numeric_binner": numeric_binner,
         "text_vectorizer": text_vectorizer,
         "multilabel_binarizers": multilabel_binarizers,
+        "price_cap": price_cap,
+        "model_type": config["model_type"],
     }
-    feature_matrix = hstack([numeric_matrix, text_matrix] + multilabel_matrices, format="csr")
+
+    feature_parts = [text_matrix]
+    if numeric_matrix is not None:
+        feature_parts.append(numeric_matrix)
+    feature_parts.extend(multilabel_matrices)
+    feature_matrix = hstack(feature_parts, format="csr")
+
+    if config["model_type"] == "bernoulli":
+        feature_matrix = maybe_binarize_matrix(feature_matrix)
+
     return transformers, feature_matrix
 
 
 def transform_features(df, transformers):
-    numeric_df = df[NUMERIC_COLS + LIKERT_COLS].apply(pd.to_numeric, errors="coerce")
-    numeric_matrix = csr_matrix(numeric_df.fillna(transformers["numeric_fill"]).to_numpy(dtype=float))
+    numeric_df, _ = preprocess_numeric_dataframe(df, price_cap=transformers["price_cap"])
+    numeric_df = numeric_df.fillna(transformers["numeric_fill"])
+    numeric_matrix = None
+    if transformers["numeric_binner"] is not None:
+        numeric_matrix = transformers["numeric_binner"].transform(numeric_df)
+
     text_matrix = transformers["text_vectorizer"].transform(combine_text(df))
 
     multilabel_matrices = []
     for col in MULTI_LABEL_COLS:
+        if col not in transformers["multilabel_binarizers"]:
+            continue
         mlb = transformers["multilabel_binarizers"][col]
         matrix = mlb.transform(df[col].apply(split_multilabel))
         multilabel_matrices.append(matrix.tocsr())
 
-    return hstack([numeric_matrix, text_matrix] + multilabel_matrices, format="csr")
+    feature_parts = [text_matrix]
+    if numeric_matrix is not None:
+        feature_parts.append(numeric_matrix)
+    feature_parts.extend(multilabel_matrices)
+    feature_matrix = hstack(feature_parts, format="csr")
+
+    if isinstance(transformers["model_type"], str) and transformers["model_type"] == "bernoulli":
+        feature_matrix = maybe_binarize_matrix(feature_matrix)
+
+    return feature_matrix
 
 
 def build_model(config):
+    if config["model_type"] == "bernoulli":
+        return BernoulliNB(alpha=config["alpha"], binarize=None)
     if config["model_type"] == "multinomial":
         return MultinomialNB(alpha=config["alpha"])
     return ComplementNB(alpha=config["alpha"])
@@ -245,22 +330,31 @@ def main():
 
     grid = list(
         product(
-            ["multinomial", "complement"],
-            [0.1, 0.5, 1.0, 2.0],
+            ["multinomial", "complement", "bernoulli"],
+            [0.1, 0.5, 1.0],
+            ["count", "tfidf"],
             [(1, 1), (1, 2)],
             [1, 2],
-            [400, 800],
+            [800, 1600],
+            [False, True],
+            [True],
+            [5],
         )
     )
 
     results = []
-    for model_type, alpha, ngram_range, min_df, max_features in grid:
+    for model_type, alpha, text_representation, ngram_range, min_df, max_features, use_numeric, use_multilabel, numeric_bins in grid:
         config = {
             "model_type": model_type,
             "alpha": alpha,
+            "text_representation": text_representation,
+            "binary_text": model_type == "bernoulli",
             "ngram_range": ngram_range,
             "min_df": min_df,
             "max_features": max_features,
+            "use_numeric": use_numeric,
+            "use_multilabel": use_multilabel,
+            "numeric_bins": numeric_bins,
         }
         try:
             fold_metrics, summary = cross_validate(
@@ -280,9 +374,9 @@ def main():
 
     results.sort(
         key=lambda item: (
-            item["summary"]["mean_log_loss"],
             -item["summary"]["mean_macro_f1"],
             -item["summary"]["mean_accuracy"],
+            item["summary"]["mean_log_loss"],
         )
     )
     best_result = results[0]
